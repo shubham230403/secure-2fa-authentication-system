@@ -1,76 +1,240 @@
 from flask import Flask, render_template, request, redirect, url_for, session
 from flask_wtf.csrf import CSRFProtect
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.security import generate_password_hash, check_password_hash
+from dotenv import load_dotenv
+
 import sqlite3
 import pyotp
 import qrcode
 from pathlib import Path
 from datetime import timedelta
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-import secrets
+import os
+import re
 
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
+load_dotenv()
+
+
+# ============================================================
+# APPLICATION SETUP
+# ============================================================
 
 app = Flask(__name__)
-csrf = CSRFProtect(app)
 
-# =========================================================
-# APPLICATION SECURITY CONFIGURATION
-# =========================================================
+SECRET_KEY = os.environ.get("SECRET_KEY")
 
-# Generate a random secret key when the application starts.
-# For production, store this in an environment variable.
-app.secret_key = secrets.token_hex(32)
+if not SECRET_KEY:
+    raise RuntimeError(
+        "SECRET_KEY is not configured. Add SECRET_KEY to the .env file."
+    )
 
-# Session configuration
+app.config["SECRET_KEY"] = SECRET_KEY
+
+# Session security
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(minutes=15)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = False  # True when using HTTPS
 
-DATABASE = "database/users.db"
+# Local development uses HTTP.
+# Set this to True when deployed behind HTTPS.
+app.config["SESSION_COOKIE_SECURE"] = False
 
-QR_FOLDER = Path("static/qr")
-QR_FOLDER.mkdir(parents=True, exist_ok=True)
+# Limit incoming request size
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
 
-# =========================================================
+# ============================================================
+# CSRF PROTECTION
+# ============================================================
+
+csrf = CSRFProtect(app)
+
+
+# ============================================================
 # RATE LIMITING
-# =========================================================
+# ============================================================
 
 limiter = Limiter(
     key_func=get_remote_address,
     app=app,
-    default_limits=["200 per day", "50 per hour"]
+    storage_uri="memory://",
+    default_limits=[
+        "200 per day",
+        "50 per hour"
+    ]
 )
 
 
-# =========================================================
-# DATABASE CONNECTION
-# =========================================================
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = BASE_DIR / "database" / "users.db"
+QR_DIRECTORY = BASE_DIR / "static" / "qr"
+
+QR_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 def get_db_connection():
-    connection = sqlite3.connect(DATABASE)
+    connection = sqlite3.connect(DATABASE_PATH)
     connection.row_factory = sqlite3.Row
     return connection
 
 
-# =========================================================
-# HOME PAGE
-# =========================================================
+# ============================================================
+# SECURITY HEADERS
+# ============================================================
+
+@app.after_request
+def add_security_headers(response):
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    response.headers["X-Frame-Options"] = "DENY"
+
+    response.headers["Referrer-Policy"] = (
+        "strict-origin-when-cross-origin"
+    )
+
+    response.headers["Permissions-Policy"] = (
+        "geolocation=(), microphone=(), camera=()"
+    )
+
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
+        "font-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+
+    return response
+
+
+# ============================================================
+# INPUT VALIDATION
+# ============================================================
+
+def valid_username(username):
+    """
+    Username:
+    - 3 to 30 characters
+    - Letters, numbers and underscore only
+    """
+
+    return bool(
+        re.fullmatch(
+            r"[A-Za-z0-9_]{3,30}",
+            username
+        )
+    )
+
+
+def valid_email(email):
+    """
+    Basic email validation.
+    """
+
+    return bool(
+        re.fullmatch(
+            r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+            r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$",
+            email
+        )
+    )
+
+
+def valid_otp(otp):
+    """
+    OTP must contain exactly 6 digits.
+    """
+
+    return bool(
+        re.fullmatch(
+            r"\d{6}",
+            otp
+        )
+    )
+
+
+def strong_password(password):
+    """
+    Password policy:
+    - Minimum 12 characters
+    - Maximum 128 characters
+    - Uppercase
+    - Lowercase
+    - Number
+    - Special character
+    - Reject common passwords
+    """
+
+    common_passwords = {
+        "password",
+        "password123",
+        "12345678",
+        "123456789",
+        "qwerty123",
+        "admin123",
+        "welcome123",
+        "letmein123",
+        "password@123"
+    }
+
+    if len(password) < 12:
+        return False
+
+    if len(password) > 128:
+        return False
+
+    if password.lower() in common_passwords:
+        return False
+
+    if not any(char.isupper() for char in password):
+        return False
+
+    if not any(char.islower() for char in password):
+        return False
+
+    if not any(char.isdigit() for char in password):
+        return False
+
+    if not any(not char.isalnum() for char in password):
+        return False
+
+    return True
+
+
+# ============================================================
+# HOME
+# ============================================================
 
 @app.route("/")
 def home():
 
-    if session.get("user"):
+    if "user_id" in session:
         return redirect(url_for("dashboard"))
 
     return render_template("home.html")
 
 
-# =========================================================
+# ============================================================
 # REGISTER
-# =========================================================
+# ============================================================
 
 @app.route("/register", methods=["GET", "POST"])
 @limiter.limit("5 per minute")
@@ -78,18 +242,50 @@ def register():
 
     if request.method == "POST":
 
-        username = request.form["username"].strip()
-        email = request.form["email"].strip()
-        password = request.form["password"]
+        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "")
 
-        # Basic password policy
-        if len(password) < 8:
+        # Length validation
+        if len(username) > 30:
             return render_template(
                 "register.html",
-                error="Password must contain at least 8 characters."
+                error="Username must not exceed 30 characters."
             )
 
-        # Hash password
+        if len(email) > 254:
+            return render_template(
+                "register.html",
+                error="Invalid email address."
+            )
+
+        # Username validation
+        if not valid_username(username):
+            return render_template(
+                "register.html",
+                error=(
+                    "Username must contain only letters, "
+                    "numbers and underscores, and be 3-30 characters."
+                )
+            )
+
+        # Email validation
+        if not valid_email(email):
+            return render_template(
+                "register.html",
+                error="Please enter a valid email address."
+            )
+
+        # Password validation
+        if not strong_password(password):
+            return render_template(
+                "register.html",
+                error=(
+                    "Password must be 12-128 characters and contain "
+                    "uppercase, lowercase, number and special character."
+                )
+            )
+
         password_hash = generate_password_hash(password)
 
         # Generate TOTP secret
@@ -99,7 +295,7 @@ def register():
 
         try:
 
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO users
                 (
@@ -109,17 +305,20 @@ def register():
                     totp_secret,
                     two_factor_enabled
                 )
-                VALUES (?, ?, ?, ?, 0)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     username,
                     email,
                     password_hash,
-                    totp_secret
+                    totp_secret,
+                    0
                 )
             )
 
             connection.commit()
+
+            user_id = cursor.lastrowid
 
         except sqlite3.IntegrityError:
 
@@ -130,10 +329,18 @@ def register():
                 error="Username or email already exists."
             )
 
-        connection.close()
+        finally:
 
-        # Temporary enrollment session
-        session["setup_username"] = username
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+        # Clear previous session data
+        session.clear()
+
+        # Store temporary setup state
+        session["setup_user_id"] = user_id
         session.permanent = True
 
         return redirect(url_for("setup_2fa"))
@@ -141,110 +348,132 @@ def register():
     return render_template("register.html")
 
 
-# =========================================================
-# SETUP 2FA AFTER REGISTRATION
-# =========================================================
+# ============================================================
+# SETUP 2FA
+# ============================================================
 
 @app.route("/setup-2fa", methods=["GET", "POST"])
 def setup_2fa():
 
-    username = session.get("setup_username")
+    user_id = session.get("setup_user_id")
 
-    if not username:
-        return redirect(url_for("login"))
+    if not user_id:
+        return redirect(url_for("register"))
 
     connection = get_db_connection()
 
     user = connection.execute(
-        "SELECT * FROM users WHERE username = ?",
-        (username,)
+        """
+        SELECT id, username, email, totp_secret
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,)
     ).fetchone()
 
     connection.close()
 
     if not user:
-        session.pop("setup_username", None)
+        session.clear()
         return redirect(url_for("register"))
 
-    # If already enabled, don't enroll again
-    if user["two_factor_enabled"]:
-        session.pop("setup_username", None)
-        return redirect(url_for("login"))
+    # Generate QR code
+    issuer = "Secure 2FA Authentication System"
 
-    secret = user["totp_secret"]
-
-    # Generate authenticator provisioning URI
-    totp = pyotp.TOTP(secret)
-
-    otp_uri = totp.provisioning_uri(
+    provisioning_uri = pyotp.TOTP(
+        user["totp_secret"]
+    ).provisioning_uri(
         name=user["email"],
-        issuer_name="Secure 2FA System"
+        issuer_name=issuer
     )
 
-    # Generate QR code
-    qr_path = QR_FOLDER / f"{username}.png"
+    # Use database ID instead of user-controlled username
+    qr_filename = f"user_{user['id']}.png"
 
-    img = qrcode.make(otp_uri)
-    img.save(qr_path)
+    qr_path = QR_DIRECTORY / qr_filename
+
+    if not qr_path.exists():
+
+        qr = qrcode.make(provisioning_uri)
+
+        qr.save(qr_path)
+
+    qr_url = url_for(
+        "static",
+        filename=f"qr/{qr_filename}"
+    )
 
     if request.method == "POST":
 
-        otp = request.form["otp"].strip()
+        otp = request.form.get("otp", "").strip()
 
-        # Verify TOTP
-        if totp.verify(otp):
+        if not valid_otp(otp):
 
-            connection = get_db_connection()
-
-            connection.execute(
-                """
-                UPDATE users
-                SET two_factor_enabled = 1
-                WHERE username = ?
-                """,
-                (username,)
+            return render_template(
+                "setup_2fa.html",
+                qr_url=qr_url,
+                username=user["username"],
+                error="Authentication code must contain exactly 6 digits."
             )
 
-            connection.commit()
-            connection.close()
+        totp = pyotp.TOTP(user["totp_secret"])
 
-            session.pop("setup_username", None)
+        if not totp.verify(otp):
 
-            return redirect(url_for("login"))
+            return render_template(
+                "setup_2fa.html",
+                qr_url=qr_url,
+                username=user["username"],
+                error="Invalid or expired authentication code."
+            )
 
-        return render_template(
-            "setup_2fa.html",
-            username=username,
-            qr_code=f"qr/{username}.png",
-            error="Invalid or expired authentication code."
+        connection = get_db_connection()
+
+        connection.execute(
+            """
+            UPDATE users
+            SET two_factor_enabled = 1
+            WHERE id = ?
+            """,
+            (user["id"],)
         )
+
+        connection.commit()
+        connection.close()
+
+        session.clear()
+
+        return redirect(url_for("login"))
 
     return render_template(
         "setup_2fa.html",
-        username=username,
-        qr_code=f"qr/{username}.png"
+        qr_url=qr_url,
+        username=user["username"]
     )
 
 
-# =========================================================
-# EXISTING USER — START 2FA SETUP
-# =========================================================
+# ============================================================
+# ENABLE 2FA
+# ============================================================
 
 @app.route("/enable-2fa", methods=["GET", "POST"])
 @limiter.limit("10 per minute")
 def enable_2fa():
 
-    # Existing user must first authenticate with password
-    if "setup_authenticated_user" not in session:
-        return redirect(url_for("login"))
+    user_id = session.get("setup_authenticated_user_id")
 
-    username = session["setup_authenticated_user"]
+    if not user_id:
+        return redirect(url_for("login"))
 
     connection = get_db_connection()
 
     user = connection.execute(
-        "SELECT * FROM users WHERE username = ?",
-        (username,)
+        """
+        SELECT id, username, email, totp_secret
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,)
     ).fetchone()
 
     connection.close()
@@ -253,68 +482,82 @@ def enable_2fa():
         session.clear()
         return redirect(url_for("login"))
 
-    # Already enabled
-    if user["two_factor_enabled"]:
-        session.pop("setup_authenticated_user", None)
-        return redirect(url_for("dashboard"))
+    issuer = "Secure 2FA Authentication System"
 
-    secret = user["totp_secret"]
-
-    # Create TOTP object
-    totp = pyotp.TOTP(secret)
-
-    otp_uri = totp.provisioning_uri(
+    provisioning_uri = pyotp.TOTP(
+        user["totp_secret"]
+    ).provisioning_uri(
         name=user["email"],
-        issuer_name="Secure 2FA System"
+        issuer_name=issuer
     )
 
-    # Generate QR code
-    qr_path = QR_FOLDER / f"{username}.png"
+    qr_filename = f"user_{user['id']}.png"
 
-    img = qrcode.make(otp_uri)
-    img.save(qr_path)
+    qr_path = QR_DIRECTORY / qr_filename
+
+    if not qr_path.exists():
+
+        qr = qrcode.make(provisioning_uri)
+
+        qr.save(qr_path)
+
+    qr_url = url_for(
+        "static",
+        filename=f"qr/{qr_filename}"
+    )
 
     if request.method == "POST":
 
-        otp = request.form["otp"].strip()
+        otp = request.form.get("otp", "").strip()
 
-        if totp.verify(otp):
+        if not valid_otp(otp):
 
-            connection = get_db_connection()
-
-            connection.execute(
-                """
-                UPDATE users
-                SET two_factor_enabled = 1
-                WHERE username = ?
-                """,
-                (username,)
+            return render_template(
+                "setup_2fa.html",
+                qr_url=qr_url,
+                username=user["username"],
+                error="Authentication code must contain exactly 6 digits."
             )
 
-            connection.commit()
-            connection.close()
+        totp = pyotp.TOTP(user["totp_secret"])
 
-            session.pop("setup_authenticated_user", None)
+        if not totp.verify(otp):
 
-            return redirect(url_for("login"))
+            return render_template(
+                "setup_2fa.html",
+                qr_url=qr_url,
+                username=user["username"],
+                error="Invalid or expired authentication code."
+            )
 
-        return render_template(
-            "setup_2fa.html",
-            username=username,
-            qr_code=f"qr/{username}.png",
-            error="Invalid or expired authentication code."
+        connection = get_db_connection()
+
+        connection.execute(
+            """
+            UPDATE users
+            SET two_factor_enabled = 1
+            WHERE id = ?
+            """,
+            (user["id"],)
         )
+
+        connection.commit()
+        connection.close()
+
+        session.clear()
+
+        return redirect(url_for("login"))
 
     return render_template(
         "setup_2fa.html",
-        username=username,
-        qr_code=f"qr/{username}.png"
+        qr_url=qr_url,
+        username=user["username"]
     )
 
 
-# =========================================================
+# ============================================================
 # LOGIN
-# =========================================================
+# ============================================================
 
 @app.route("/login", methods=["GET", "POST"])
 @limiter.limit("10 per minute")
@@ -322,14 +565,27 @@ def login():
 
     if request.method == "POST":
 
-        username = request.form["username"].strip()
-        password = request.form["password"]
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if len(username) > 30:
+
+            return render_template(
+                "login.html",
+                error="Invalid username or password."
+            )
 
         connection = get_db_connection()
 
         user = connection.execute(
             """
-            SELECT *
+            SELECT
+                id,
+                username,
+                email,
+                password_hash,
+                totp_secret,
+                two_factor_enabled
             FROM users
             WHERE username = ?
             """,
@@ -338,7 +594,7 @@ def login():
 
         connection.close()
 
-        # Verify username and password
+        # Generic authentication error
         if not user or not check_password_hash(
             user["password_hash"],
             password
@@ -349,107 +605,142 @@ def login():
                 error="Invalid username or password."
             )
 
+        # Prevent session fixation
+        session.clear()
         session.permanent = True
 
-        # =================================================
-        # EXISTING USER WITHOUT 2FA
-        # =================================================
-
+        # 2FA not enabled
         if not user["two_factor_enabled"]:
 
-            session["setup_authenticated_user"] = username
+            session["setup_authenticated_user_id"] = user["id"]
 
             return redirect(url_for("enable_2fa"))
 
-        # =================================================
-        # EXISTING USER WITH 2FA
-        # =================================================
-
-        session["pending_2fa_user"] = username
+        # 2FA enabled
+        session["pending_2fa_user_id"] = user["id"]
 
         return redirect(url_for("verify_2fa"))
 
     return render_template("login.html")
 
 
-# =========================================================
-# VERIFY 2FA DURING LOGIN
-# =========================================================
+# ============================================================
+# VERIFY 2FA
+# ============================================================
 
 @app.route("/verify-2fa", methods=["GET", "POST"])
 @limiter.limit("10 per minute")
 def verify_2fa():
 
-    username = session.get("pending_2fa_user")
+    user_id = session.get("pending_2fa_user_id")
 
-    if not username:
+    if not user_id:
         return redirect(url_for("login"))
 
     connection = get_db_connection()
 
     user = connection.execute(
         """
-        SELECT *
+        SELECT
+            id,
+            username,
+            email,
+            totp_secret,
+            two_factor_enabled
         FROM users
-        WHERE username = ?
+        WHERE id = ?
         """,
-        (username,)
+        (user_id,)
+    ).fetchone()
+
+    connection.close()
+
+    if not user or not user["two_factor_enabled"]:
+
+        session.clear()
+
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+
+        otp = request.form.get("otp", "").strip()
+
+        # Server-side OTP validation
+        if not valid_otp(otp):
+
+            return render_template(
+                "verify_2fa.html",
+                error="Authentication code must contain exactly 6 digits."
+            )
+
+        totp = pyotp.TOTP(user["totp_secret"])
+
+        if not totp.verify(otp):
+
+            return render_template(
+                "verify_2fa.html",
+                error="Invalid or expired authentication code."
+            )
+
+        # Authentication successful
+        session.pop("pending_2fa_user_id", None)
+
+        session["user_id"] = user["id"]
+        session["user"] = user["username"]
+
+        session.permanent = True
+
+        return redirect(url_for("dashboard"))
+
+    return render_template("verify_2fa.html")
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+@app.route("/dashboard")
+def dashboard():
+
+    user_id = session.get("user_id")
+    username = session.get("user")
+
+    if not user_id or not username:
+
+        session.clear()
+
+        return redirect(url_for("login"))
+
+    connection = get_db_connection()
+
+    user = connection.execute(
+        """
+        SELECT id, username, email, two_factor_enabled, created_at
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,)
     ).fetchone()
 
     connection.close()
 
     if not user:
+
         session.clear()
-        return redirect(url_for("login"))
 
-    if request.method == "POST":
-
-        otp = request.form["otp"].strip()
-
-        totp = pyotp.TOTP(user["totp_secret"])
-
-        if totp.verify(otp):
-
-            # Remove temporary authentication state
-            session.pop("pending_2fa_user", None)
-
-            # Create authenticated session
-            session["user"] = username
-            session.permanent = True
-
-            return redirect(url_for("dashboard"))
-
-        return render_template(
-            "verify_2fa.html",
-            error="Invalid or expired authentication code."
-        )
-
-    return render_template("verify_2fa.html")
-
-
-# =========================================================
-# DASHBOARD
-# =========================================================
-
-@app.route("/dashboard")
-def dashboard():
-
-    username = session.get("user")
-
-    if not username:
         return redirect(url_for("login"))
 
     return render_template(
         "dashboard.html",
-        username=username
+        user=user
     )
 
 
-# =========================================================
+# ============================================================
 # LOGOUT
-# =========================================================
+# ============================================================
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 def logout():
 
     session.clear()
@@ -457,9 +748,14 @@ def logout():
     return redirect(url_for("login"))
 
 
-# =========================================================
-# RUN APPLICATION
-# =========================================================
+# ============================================================
+# APPLICATION START
+# ============================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=False
+    )

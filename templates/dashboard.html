@@ -25,9 +25,10 @@
     <p>
         Two-factor authentication: ✓
     </p>
-
-    <a href="/logout">Logout</a>
-
+    <form method="POST" action="{{ url_for('logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit">Logout</button>
+    </form>
 </body>
 
 </html>
